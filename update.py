@@ -110,7 +110,7 @@ if DATABASE_URL:
 
 UPSTREAM_REPO = config_file.get(
     "UPSTREAM_REPO",
-    "https://github.com/JohnyWalker167/acolabv2",
+    "https://github.com/JohnyWalker167/colabml.git",
 )
 
 UPSTREAM_BRANCH = config_file.get("UPSTREAM_BRANCH", "") or "main"
