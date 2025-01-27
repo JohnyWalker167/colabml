@@ -616,99 +616,151 @@ class TaskConfig:
                             self.is_cancelled = True
         return t_path if self.is_file and code == 0 else dl_path
 
-
-
-
     async def proceed_ffmpeg(self, dl_path, gid):
         checked = False
         cmds = [
             [part.strip() for part in split(item) if part.strip()]
             for item in self.ffmpeg_cmds
         ]
-
-        async def generate_file_list(dl_path):
-            # Step 1: Gather the paths of all video files and subtitle files in the folder
-            video_files = []
-            subtitle_files = []
-
-            for dirpath, _, files in await to_thread(walk, dl_path):
-                for file_ in files:
-                    file_path = ospath.join(dirpath, file_)
-                    is_video, _, _ = await get_document_type(file_path)
-                    if is_video:
-                        video_files.append(file_path)
-                    elif file_path.endswith('.srt'):
-                        subtitle_files.append(file_path)
-
-            video_files.sort()
-            subtitle_files.sort()
-
-            video_files = [f"file '{file_path}'" for file_path in video_files]
-            subtitle_files = [f"file '{file_path}'" for file_path in subtitle_files]
-
-            if video_files or subtitle_files:
-                file_list_path = ospath.join(dl_path, "file_list.txt")
-                async with aiofiles.open(file_list_path, 'w') as file_list:
-                    await file_list.write("\n".join(video_files + subtitle_files))
-
-            return video_files, subtitle_files
-
-
         try:
             ffmpeg = FFMpeg(self)
-            video_files, subtitle_files = await generate_file_list(dl_path)
-            folder_name = ospath.basename(dl_path)
-
-
-            if len(video_files) > 1 and all(file.endswith('.mkv') for file in video_files):
-                # Condition 1: Multiple MKV files
+            for ffmpeg_cmd in cmds:
+                self.proceed_count = 0
                 cmd = [
                     "ffmpeg",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", ospath.join(dl_path, "file_list.txt"),
-                    "-c", "copy",
-                    ospath.join(dl_path, f"{folder_name}.mkv")
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-progress",
+                    "pipe:1",
+                    "-threads",  # Should work
+                    "4",
+                    *ffmpeg_cmd,
                 ]
-                LOGGER.info(f"Running ffmpeg cmd for merging MKV files: {cmd}")
-                res = await ffmpeg.ffmpeg_cmds(cmd, dl_path)
-                if res:
-                    for file_path in video_files:
-                        await remove(file_path)
-                    dl_path = ospath.join(dl_path, f"{folder_name}.mkv")
-
-            elif len(video_files) == 1 and video_files[0].endswith('.mp4') and len(subtitle_files) == 1:
-                # Condition 2: Single MP4 file with one SRT subtitle
-                cmd = [
-                    "ffmpeg",
-                    "-i", video_files[0],
-                    "-i", subtitle_files[0],
-                    "-c:v", "copy",
-                    "-c:a", "copy",
-                    "-c:s", "mov_text",
-                    ospath.join(dl_path, f"{folder_name}X.mp4")
-                ]
-                LOGGER.info(f"Running ffmpeg cmd for merging MP4 file with SRT: {cmd}")
-                res = await ffmpeg.ffmpeg_cmds(cmd, dl_path)
-                if res:
-                    await remove(video_files[0])
-                    await remove(subtitle_files[0])
-                    dl_path = ospath.join(dl_path, f"{folder_name}X.mp4")
-
-            else:
-                LOGGER.error("Unexpected file structure in the download path.")
-                return False
-
-            # Log errors in the ffmpeg log file
-            ffmpeg_log_path = ospath.join(dl_path, "ffmpeg_error.log")
-            if res:
-                async with aiofiles.open(ffmpeg_log_path, 'w') as log_file:
-                    await log_file.write(res)
-
-        except Exception as e:
-            LOGGER.error(f"Error processing ffmpeg: {e}")
-            return False
-
+                if "-del" in cmd:
+                    cmd.remove("-del")
+                    delete_files = True
+                else:
+                    delete_files = False
+                index = cmd.index("-i")
+                input_file = cmd[index + 1]
+                if input_file.endswith(".video"):
+                    ext = "video"
+                elif input_file.endswith(".audio"):
+                    ext = "audio"
+                elif "." not in input_file:
+                    ext = "all"
+                else:
+                    ext = ospath.splitext(input_file)[-1].lower()
+                if await aiopath.isfile(dl_path):
+                    is_video, is_audio, _ = await get_document_type(dl_path)
+                    if (not is_video and not is_audio) or (
+                        is_video and ext == "audio"
+                    ):
+                        break
+                    if (is_audio and not is_video and ext == "video") or (
+                        ext
+                        not in [
+                            "all",
+                            "audio",
+                            "video",
+                        ]
+                        and not dl_path.lower().endswith(ext)
+                    ):
+                        break
+                    new_folder = ospath.splitext(dl_path)[0]
+                    name = ospath.basename(dl_path)
+                    await makedirs(new_folder, exist_ok=True)
+                    file_path = f"{new_folder}/{name}"
+                    await move(dl_path, file_path)
+                    if not checked:
+                        checked = True
+                        async with task_dict_lock:
+                            task_dict[self.mid] = FFmpegStatus(
+                                self,
+                                ffmpeg,
+                                gid,
+                                "FFmpeg",
+                            )
+                        self.progress = False
+                        await cpu_eater_lock.acquire()
+                        self.progress = True
+                    LOGGER.info(f"Running ffmpeg cmd for: {file_path}")
+                    cmd[index + 1] = file_path
+                    self.subsize = self.size
+                    res = await ffmpeg.ffmpeg_cmds(cmd, file_path)
+                    if res:
+                        if delete_files:
+                            await remove(file_path)
+                            if len(await listdir(new_folder)) == 1:
+                                folder = new_folder.rsplit("/", 1)[0]
+                                self.name = ospath.basename(res[0])
+                                if self.name.startswith("ffmpeg"):
+                                    self.name = self.name.split(".", 1)[-1]
+                                dl_path = ospath.join(folder, self.name)
+                                await move(res[0], dl_path)
+                                await rmtree(new_folder)
+                            else:
+                                dl_path = new_folder
+                                self.name = new_folder.rsplit("/", 1)[-1]
+                        else:
+                            dl_path = new_folder
+                            self.name = new_folder.rsplit("/", 1)[-1]
+                    else:
+                        await move(file_path, dl_path)
+                        await rmtree(new_folder)
+                else:
+                    for dirpath, _, files in await sync_to_async(
+                        walk,
+                        dl_path,
+                        topdown=False,
+                    ):
+                        for file_ in files:
+                            var_cmd = cmd.copy()
+                            if self.is_cancelled:
+                                return False
+                            f_path = ospath.join(dirpath, file_)
+                            is_video, is_audio, _ = await get_document_type(f_path)
+                            if (not is_video and not is_audio) or (
+                                is_video and ext == "audio"
+                            ):
+                                continue
+                            if (is_audio and not is_video and ext == "video") or (
+                                ext
+                                not in [
+                                    "all",
+                                    "audio",
+                                    "video",
+                                ]
+                                and not f_path.lower().endswith(ext)
+                            ):
+                                continue
+                            self.proceed_count += 1
+                            var_cmd[index + 1] = f_path
+                            if not checked:
+                                checked = True
+                                async with task_dict_lock:
+                                    task_dict[self.mid] = FFmpegStatus(
+                                        self,
+                                        ffmpeg,
+                                        gid,
+                                        "FFmpeg",
+                                    )
+                                self.progress = False
+                                await cpu_eater_lock.acquire()
+                                self.progress = True
+                            LOGGER.info(f"Running ffmpeg cmd for: {f_path}")
+                            self.subsize = await get_path_size(f_path)
+                            self.subname = file_
+                            res = await ffmpeg.ffmpeg_cmds(var_cmd, f_path)
+                            if res and delete_files:
+                                await remove(f_path)
+                                if len(res) == 1:
+                                    file_name = ospath.basename(res[0])
+                                    if file_name.startswith("ffmpeg"):
+                                        newname = file_name.split(".", 1)[-1]
+                                        newres = ospath.join(dirpath, newname)
+                                        await move(res[0], newres)
         finally:
             if checked:
                 cpu_eater_lock.release()
