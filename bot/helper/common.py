@@ -657,7 +657,7 @@ class TaskConfig:
             for mp4_file in mp4_files:
                 self.proceed_count = 0
                 input_file_path = mp4_file  # Use the found mp4 file path as input
-                output_file_path = f"{os.path.splitext(mp4_file)[0]}_with_subtitles{os.path.splitext(mp4_file)[1]}"  # Generate output file path
+                output_file_path = f"{os.path.splitext(mp4_file)[0]}X{os.path.splitext(mp4_file)[1]}"  # Generate output file path
 
                 cmd = [
                     'ffmpeg',
