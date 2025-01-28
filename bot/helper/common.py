@@ -1,7 +1,7 @@
 import contextlib
 import os
 import aiofiles
-from asyncio import gather, sleep, to_thread
+from asyncio import gather, sleep, 
 from os import path as ospath
 from os import walk
 from re import IGNORECASE, sub
@@ -220,26 +220,8 @@ class TaskConfig:
             and self.up_dest in self.user_dict["upload_paths"]
         ):
             self.up_dest = self.user_dict["upload_paths"][self.up_dest]
-
-        if self.ffmpeg_cmds and not isinstance(self.ffmpeg_cmds, list):
-            if self.user_dict.get("ffmpeg_cmds", None):
-                ffmpeg_dict = self.user_dict["ffmpeg_cmds"]
-                self.ffmpeg_cmds = [
-                    value
-                    for key in list(self.ffmpeg_cmds)
-                    if key in ffmpeg_dict
-                    for value in ffmpeg_dict[key]
-                ]
-            elif "ffmpeg_cmds" not in self.user_dict and Config.FFMPEG_CMDS:
-                ffmpeg_dict = Config.FFMPEG_CMDS
-                self.ffmpeg_cmds = [
-                    value
-                    for key in list(self.ffmpeg_cmds)
-                    if key in ffmpeg_dict
-                    for value in ffmpeg_dict[key]
-                ]
-            else:
-                self.ffmpeg_cmds = None
+        if self.ffmpeg_cmds is None:
+            self.ffmpeg_cmds = self.user_dict.get("ffmpeg_cmds", None)
         if not self.is_leech:
             self.stop_duplicate = self.user_dict.get("stop_duplicate") or (
                 "stop_duplicate" not in self.user_dict and Config.STOP_DUPLICATE
@@ -571,55 +553,10 @@ class TaskConfig:
                 "Reply to text file or to telegram message that have links seperated by new line!",
             )
 
-    async def proceed_extract(self, dl_path, gid):
-        pswd = self.extract if isinstance(self.extract, str) else ""
-        self.files_to_proceed = []
-        if self.is_file and is_archive(dl_path):
-            self.files_to_proceed.append(dl_path)
-        else:
-            for dirpath, _, files in await sync_to_async(
-                walk,
-                dl_path,
-                topdown=False,
-            ):
-                for file_ in files:
-                    if is_first_archive_split(file_) or (
-                        is_archive(file_) and not file_.lower().endswith(".rar")
-                    ):
-                        f_path = ospath.join(dirpath, file_)
-                        self.files_to_proceed.append(f_path)
-
-        if not self.files_to_proceed:
-            return dl_path
-        sevenz = SevenZ(self)
-        LOGGER.info(f"Extracting: {self.name}")
-        async with task_dict_lock:
-            task_dict[self.mid] = SevenZStatus(self, sevenz, gid, "Extract")
-        for dirpath, _, files in await sync_to_async(walk, self.dir, topdown=False):
-            for file_ in files:
-                if is_first_archive_split(file_) or (
-                    is_archive(file_) and not file_.lower().endswith(".rar")
-                ):
-                    self.proceed_count += 1
-                    f_path = ospath.join(dirpath, file_)
-                    t_path = get_base_name(f_path) if self.is_file else dirpath
-                    if not self.is_file:
-                        self.subname = file_
-                    code = await sevenz.extract(f_path, t_path, pswd)
-            if code == 0:
-                for file_ in files:
-                    if is_archive_split(file_) or is_archive(file_):
-                        del_path = ospath.join(dirpath, file_)
-                        try:
-                            await remove(del_path)
-                        except Exception:
-                            self.is_cancelled = True
-        return t_path if self.is_file and code == 0 else dl_path
-
-
     async def proceed_ffmpeg(self, dl_path, gid):
         LOGGER.info("Starting proceed_ffmpeg function.")
         checked = False
+        original_files = []  # List to keep track of original input files
         cmds = [
             [part.strip() for part in split(item) if part.strip()]
             for item in self.ffmpeg_cmds
@@ -633,83 +570,96 @@ class TaskConfig:
                     if file.lower().endswith(extension):
                         found_files.append(os.path.join(dirpath, file))
             return found_files
-       
-        
+
         # Find the subtitle file in the directory
         LOGGER.info("Searching for subtitle files.")
         subtitle_file_path = await find_files(dl_path, '.srt')
         if not subtitle_file_path:
             LOGGER.error("No subtitle file found in the directory.")
-            return dl_path
-        subtitle_file_path = subtitle_file_path[0]  # Assuming there's only one subtitle file
-        LOGGER.info(f"Subtitle file found: {subtitle_file_path}")
+        else:
+            subtitle_file_path = subtitle_file_path[0]  # Assuming there's only one subtitle file
+            LOGGER.info(f"Subtitle file found: {subtitle_file_path}")
 
-        # Find the mp4 files in the directory
-        LOGGER.info("Searching for MP4 files.")
-        mp4_files = await find_files(dl_path, '.mp4')
-        if not mp4_files:
-            LOGGER.error("No MP4 file found in the directory.")
-            return dl_path
-        LOGGER.info(f"MP4 files found: {mp4_files}")
+        folder_name = os.path.basename(os.path.normpath(dl_path))
 
-        try:
+        # Find the mkv files in the directory
+        LOGGER.info("Searching for MKV files.")
+        mkv_files = await find_files(dl_path, '.mkv')
+        if len(mkv_files) > 2:
+            LOGGER.info(f"Multiple MKV files found: {mkv_files}")
+            input_txt_path = os.path.join(dl_path, 'input.txt')
+            # Create input.txt for concat
+            async with aiofiles.open(input_txt_path, 'w') as f:
+                for mkv_file in mkv_files:
+                    original_files.append(mkv_file)  # Track the original input file
+                    await f.write(f"file '{mkv_file}'\n")
+            
+            # Use the provided ffmpeg command
+            output_file_path = os.path.join(dl_path, f"{folder_name}.mkv")
+            ffmpeg_command = [
+                'ffmpeg',
+                '-loglevel', 'error', '-stats',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', input_txt_path,
+                '-c', 'copy',
+                '-map', '0:v',
+                '-map', '0:a',
+                '-map', '0:s',
+                output_file_path
+            ]
+            
             ffmpeg = FFMpeg(self)
-            for mp4_file in mp4_files:
-                self.proceed_count = 0
-                input_file_path = mp4_file  # Use the found mp4 file path as input
-                output_file_path = f"{os.path.splitext(mp4_file)[0]}X{os.path.splitext(mp4_file)[1]}"  # Generate output file path
+            if not checked:
+                checked = True
+                async with task_dict_lock:
+                    task_dict[self.mid] = FFmpegStatus(
+                        self,
+                        ffmpeg,
+                        gid,
+                        "FFmpeg",
+                    )
+                self.progress = False
+                await cpu_eater_lock.acquire()
+                self.progress = True
+            LOGGER.info(f"Running ffmpeg command for concatenation: {input_txt_path}")
+            LOGGER.debug(f"FFmpeg command: {' '.join(ffmpeg_command)}")
+            self.subsize = self.size
+            res = await ffmpeg.ffmpeg_cmds(ffmpeg_command, input_txt_path)
+            if res:
+                dl_path = output_file_path
+                LOGGER.info(f"Successfully processed concatenated file: {output_file_path}")
+        else:
+            # Find the mp4 files in the directory
+            LOGGER.info("Searching for MP4 files.")
+            mp4_files = await find_files(dl_path, '.mp4')
+            if not mp4_files:
+                LOGGER.error("No MP4 file found in the directory.")
+            LOGGER.info(f"MP4 files found: {mp4_files}")
 
-                cmd = [
-                    'ffmpeg',
-                    '-i', input_file_path,
-                    '-i', subtitle_file_path,  # Include the found SRT subtitle file
-                    '-c:v', 'copy',  # Copy video stream
-                    '-c:a', 'copy',  # Copy audio stream
-                    '-c:s', 'mov_text',  # Use mov_text codec for the subtitle
-                    '-map', '0:v',  # Map the video stream
-                    '-map', '0:a',  # Map the selected audio stream
-                    '-map', '1',  # Map the new subtitle file
-                    output_file_path
-                ]
+            try:
+                ffmpeg = FFMpeg(self)
+                if mp4_file and subtitle_file_path:
+                    for mp4_file in mp4_files:
+                        self.proceed_count = 0
+                        input_file_path = mp4_file  # Use the found mp4 file path as input
+                        original_files.append(input_file_path)  # Track the original input file
+                        output_file_path = os.path.join(dl_path, f"{folder_name}.mp4")  # Use folder name for output file
 
-                if await aiopath.isfile(mp4_file):
-                    if not checked:
-                        checked = True
-                        async with task_dict_lock:
-                            task_dict[self.mid] = FFmpegStatus(
-                                self,
-                                ffmpeg,
-                                gid,
-                                "FFmpeg",
-                            )
-                        self.progress = False
-                        await cpu_eater_lock.acquire()
-                        self.progress = True
-                    LOGGER.info(f"Running ffmpeg command for: {input_file_path}")
-                    LOGGER.debug(f"FFmpeg command: {' '.join(cmd)}")
-                    self.subsize = self.size
-                    res = await ffmpeg.ffmpeg_cmds(cmd, input_file_path)
-                    if res:
-                        dl_path = output_file_path
-                        LOGGER.info(f"Successfully processed file: {input_file_path}")
-                        LOGGER.info(f"Output file created: {output_file_path}")
-                        # Optionally, delete the original file
-                        await remove(input_file_path)
-                        LOGGER.info(f"Deleted original file: {input_file_path}")
-                else:
-                    for dirpath, _, files in await sync_to_async(
-                        walk,
-                        dl_path,
-                        topdown=False,
-                    ):
-                        for file_ in files:
-                            var_cmd = cmd.copy()
-                            if self.is_cancelled:
-                                LOGGER.warning("Process cancelled.")
-                                return False
-                            f_path = os.path.join(dirpath, file_)
-                            self.proceed_count += 1
-                            var_cmd[2] = f_path
+                        cmd = [
+                            'ffmpeg',
+                            '-i', input_file_path,
+                            '-i', subtitle_file_path,  # Include the found SRT subtitle file
+                            '-c:v', 'copy',  # Copy video stream
+                            '-c:a', 'copy',  # Copy audio stream
+                            '-c:s', 'mov_text',  # Use mov_text codec for the subtitle
+                            '-map', '0:v',  # Map the video stream
+                            '-map', '0:a',  # Map the selected audio stream
+                            '-map', '1',  # Map the new subtitle file
+                            output_file_path
+                        ]
+
+                        if await aiopath.isfile(mp4_file):
                             if not checked:
                                 checked = True
                                 async with task_dict_lock:
@@ -722,23 +672,58 @@ class TaskConfig:
                                 self.progress = False
                                 await cpu_eater_lock.acquire()
                                 self.progress = True
-                            LOGGER.info(f"Running ffmpeg command for: {f_path}")
-                            LOGGER.debug(f"FFmpeg command: {' '.join(var_cmd)}")
-                            self.subsize = await get_path_size(f_path)
-                            self.subname = file_
-                            res = await ffmpeg.ffmpeg_cmds(var_cmd, f_path)
+                            LOGGER.info(f"Running ffmpeg command for: {input_file_path}")
+                            LOGGER.debug(f"FFmpeg command: {' '.join(cmd)}")
+                            self.subsize = self.size
+                            res = await ffmpeg.ffmpeg_cmds(cmd, input_file_path)
                             if res:
                                 dl_path = output_file_path
-                                LOGGER.info(f"Successfully processed file: {f_path}")
+                                LOGGER.info(f"Successfully processed file: {input_file_path}")
                                 LOGGER.info(f"Output file created: {output_file_path}")
-                                # Optionally, delete the original file
-                                await remove(f_path)
-                                LOGGER.info(f"Deleted original file: {f_path}")
-        finally:
-            if checked:
-                cpu_eater_lock.release()
-                LOGGER.info("Released CPU eater lock.")
-        LOGGER.info("Completed proceed_ffmpeg function.")
+                        else:
+                            for dirpath, _, files in await sync_to_async(
+                                walk,
+                                dl_path,
+                                topdown=False,
+                            ):
+                                for file_ in files:
+                                    var_cmd = cmd.copy()
+                                    if self.is_cancelled:
+                                        LOGGER.warning("Process cancelled.")
+                                        return False
+                                    f_path = os.path.join(dirpath, file_)
+                                    self.proceed_count += 1
+                                    var_cmd[2] = f_path
+                                    if not checked:
+                                        checked = True
+                                        async with task_dict_lock:
+                                            task_dict[self.mid] = FFmpegStatus(
+                                                self,
+                                                ffmpeg,
+                                                gid,
+                                                "FFmpeg",
+                                            )
+                                        self.progress = False
+                                        await cpu_eater_lock.acquire()
+                                        self.progress = True
+                                    LOGGER.info(f"Running ffmpeg command for: {f_path}")
+                                    LOGGER.debug(f"FFmpeg command: {' '.join(var_cmd)}")
+                                    self.subsize = await get_path_size(f_path)
+                                    self.subname = file_
+                                    res = await ffmpeg.ffmpeg_cmds(var_cmd, f_path)
+                                    if res:
+                                        dl_path = output_file_path
+                                        LOGGER.info(f"Successfully processed file: {f_path}")
+                                        LOGGER.info(f"Output file created: {output_file_path}")
+            finally:
+                if checked:
+                    cpu_eater_lock.release()
+                    LOGGER.info("Released CPU eater lock.")
+                # Remove the original input files before returning
+                for file in original_files:
+                    await remove(file)
+                    LOGGER.info(f"Deleted original file: {file}")
+                LOGGER.info("Completed proceed_ffmpeg function.")
         return dl_path
 
     async def substitute(self, dl_path):

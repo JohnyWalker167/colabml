@@ -39,15 +39,16 @@ class FFmpegStatus:
     def status(self):
         if self._cstatus == "Convert":
             return MirrorStatus.STATUS_CONVERT
-        if self._cstatus == "Split":
+        elif self._cstatus == "Split":
             return MirrorStatus.STATUS_SPLIT
-        if self._cstatus == "Sample Video":
+        elif self._cstatus == "Sample Video":
             return MirrorStatus.STATUS_SAMVID
-        if self._cstatus == "Metadata":
+        elif self._cstatus == "Metadata":
             return MirrorStatus.STATUS_METADATA
-        if self._cstatus == "Watermark":
+        elif self._cstatus == "Watermark":
             return MirrorStatus.STATUS_WATERMARK
-        return MirrorStatus.STATUS_FFMPEG
+        else:
+            return MirrorStatus.STATUS_FFMPEG
 
     def task(self):
         return self
